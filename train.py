@@ -1,13 +1,11 @@
-import os
-from copy import deepcopy
+from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from datasets import load_dataset, load_from_disk
+from load_dsets import load_dset_by_name, collate_fn
 import numpy as np
-from typing import Dict, List, Tuple, Optional
 import logging
 from dataclasses import dataclass
 from tqdm import tqdm
@@ -22,6 +20,7 @@ class TrainingConfig:
     model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     #model_name: str = 'llamafactory/tiny-random-Llama-3'
     #model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    dset_name: str = "moviesumm"
     max_length: int = 512
     batch_size: int = 1
     learning_rate: float = 1e-6
@@ -34,23 +33,6 @@ class TrainingConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-class SummarizationDataset(Dataset):
-    def __init__(self, texts: List[str], summaries: List[str], tokenizer, max_length: int = 512):
-        self.texts = texts
-        self.summaries = summaries
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        summary = self.summaries[idx]
-        inputs = self.tokenizer(text, max_length=self.max_length, truncation=True, padding="max_length", return_tensors="pt")
-        targets = self.tokenizer(summary, max_length=self.max_length // 4, truncation=True, padding="max_length", return_tensors="pt")
-        return {"input_ids": inputs["input_ids"].squeeze(), "attention_mask": inputs["attention_mask"].squeeze(), "target_ids": targets["input_ids"].squeeze(), "target_attention_mask": targets["attention_mask"].squeeze()}
 
 class ValueNetwork(nn.Module):
     def __init__(self, model):
@@ -71,7 +53,6 @@ class PPOTrainer:
         self.prev_summ_model = prev_summ_model
         self.tokenizer = tokenizer
         self.config = config
-        #summ_model_for_val_net = deepcopy(summ_model)
         summ_model_for_val_net = AutoModelForCausalLM.from_pretrained(config.model_name, load_in_4bit=True).to(config.device) # policy networkdeepcopy(summ_model)
         self.value_net = ValueNetwork(summ_model_for_val_net).to(config.device)
         self.summ_model_opt = torch.optim.AdamW(summ_model.parameters(), lr=config.learning_rate, eps=1)
@@ -84,25 +65,26 @@ class PPOTrainer:
 
     def train_step(self, batch):
         batch = {k:v.to(self.config.device) for k,v in batch.items()}
-        inter_summ_outputs = self.summ_model.generate(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], max_new_tokens=self.max_inter_summ_len, pad_token_id=self.tokenizer.pad_token_id, return_dict_in_generate=True, output_scores=True, temperature=1, top_p=1, do_sample=False)
-        inter_summ_ids = inter_summ_outputs.sequences[:,-self.max_inter_summ_len:]
+        inter_summ_outputs = self.summ_model.generate(input_ids=batch['input_ids'][0], attention_mask=batch['attention_mask'][0], max_new_tokens=self.max_inter_summ_len, pad_token_id=self.tokenizer.pad_token_id, return_dict_in_generate=True, output_scores=True, temperature=1, top_p=1, do_sample=False)
+        inter_summ_ids = torch.tensor(inter_summ_outputs.sequences)[:,-self.max_inter_summ_len:]
         eos_mask = torch.cumsum((inter_summ_ids == self.tokenizer.eos_token_id).long(), dim=1)
         inter_summ_attn_mask = (eos_mask <= 1).long()
+        #inter_summ_ids, inter_summ_attn_mask = inter_summ_ids.flatten(), inter_summ_attn_mask.flatten()
 
-        final_summ_input_ids = torch.cat([inter_summ_ids, batch['target_ids']], axis=1)
-        final_summ_attn_mask = torch.cat([inter_summ_attn_mask, batch['target_attention_mask']], axis=1)
-        final_summ_labels = torch.cat([-100*torch.ones_like(inter_summ_ids), batch['target_ids']], axis=1)
-        final_summ_outputs = self.summ_model(input_ids=final_summ_input_ids, attention_mask=final_summ_attn_mask, labels=final_summ_labels)
+        final_summ_input_ids = torch.cat([inter_summ_ids.flatten(), batch['target_ids'].squeeze(0)])
+        final_summ_attn_mask = torch.cat([inter_summ_attn_mask.flatten(), batch['target_attention_mask'].squeeze(0)])
+        final_summ_labels = torch.cat([-100*torch.ones_like(inter_summ_ids.flatten()), batch['target_ids'].squeeze(0)])
+        final_summ_outputs = self.summ_model(input_ids=final_summ_input_ids.unsqueeze(0), attention_mask=final_summ_attn_mask.unsqueeze(0), labels=final_summ_labels.unsqueeze(0))
         logits = final_summ_outputs.logits
         vocab_size = logits.size(-1)
         loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
-        losses = loss_fn(logits.view(-1, vocab_size), final_summ_labels.view(-1))
-        losses = losses.view(final_summ_labels.size())  # shape [batch_size, seq_len]
+        losses = loss_fn(logits.permute(0,2,1), final_summ_labels.unsqueeze(0))
         per_item_loss = losses.mean(dim=1)  # mean over tokens per example
         final_reward = -per_item_loss.detach()
         final_summ_loss = per_item_loss.mean()
 
-        value_preds = self.value_net(batch['input_ids'], inter_summ_ids) # assume input_ids already contains a prompt telling model to summarise
+        #value_preds = self.value_net(batch['input_ids'], inter_summ_ids) # assume input_ids already contains a prompt telling model to summarise
+        value_preds = self.value_net(batch['input_ids'][0], inter_summ_ids) # assume input_ids already contains a prompt telling model to summarise
         N = inter_summ_attn_mask.sum(axis=1)
         advantages_lst = []
         value_loss = 0
@@ -122,12 +104,11 @@ class PPOTrainer:
         value_loss = 1e-5*value_loss / self.config.batch_size
         advantages = torch.stack(advantages_lst)
         # PPO update
-        pis_inputs = torch.cat([batch['input_ids'], inter_summ_ids], axis=1)
-        pis_attn = torch.cat([batch['attention_mask'], inter_summ_attn_mask], axis=1)
+        pis_inputs = torch.cat([batch['input_ids'][0], inter_summ_ids], axis=1)
+        pis_attn = torch.cat([batch['attention_mask'][0], inter_summ_attn_mask], axis=1)
         def probs_from_model(m):
             with torch.no_grad():
                 m_outputs = m(input_ids=pis_inputs, attention_mask=pis_attn)#, labels=final_summ_labels)
-            #curr_logits = torch.stack(inter_summ_outputs.scores, axis=1)
             logits = m_outputs.logits[:, batch['input_ids'].shape[1]:]
             all_probs = F.softmax(logits, dim=-1)
             trans_probs = torch.gather(all_probs, 2, inter_summ_ids[:,:,None]).squeeze(2)
@@ -143,14 +124,8 @@ class PPOTrainer:
         policy_loss = (-ppo_objective * mask).sum()
         if policy_loss.isnan():
             breakpoint()
-        #self.prev_summ_model = deepcopy(self.summ_model) # copy right before updating summ_model
         (policy_loss + final_summ_loss).backward()
         torch.nn.utils.clip_grad_norm_(self.summ_model.parameters(), max_norm=1.0)
-        #before_pnans = [n for n,x in self.summ_model.named_parameters() if x.isnan().any()]
-        #if len(before_pnans) > 0:
-        #    print(f'nan params in summ_model: {before_pnans}')
-        #print(f'grads in summ_model: {[(n,x.grad.max()) for n,x in self.summ_model.named_parameters() if x.requires_grad]}')
-        #breakpoint()
         self.summ_model_opt.step()
         self.value_optimizer.zero_grad()
         value_loss.backward()
@@ -163,30 +138,32 @@ class PPOTrainer:
             breakpoint()
         return scores
 
+    def generate_example(self, example_input):
+        inter_summ_outputs = self.summ_model.generate(input_ids=torch.tensor(example_input['input_ids']).to(self.summ_model.device)[:3,-1000:], max_new_tokens=self.max_inter_summ_len, pad_token_id=self.tokenizer.pad_token_id, return_dict_in_generate=True, output_scores=True, temperature=1, top_p=1, do_sample=False)
+        inter_summ_ids = inter_summ_outputs.sequences[0,-self.max_inter_summ_len:]
+        final_summ_input_ids = torch.cat([torch.tensor(self.tokenizer('Summarise the following text: ').input_ids, device=self.summ_model.device), inter_summ_ids], axis=0)
+        final_summ_genned_ids = self.summ_model.generate(input_ids=final_summ_input_ids.unsqueeze(0))
+        final_text = self.tokenizer.decode(final_summ_genned_ids[0], skip_special_tokens=True)
+        inp_text = ' '.join(self.tokenizer.batch_decode(torch.tensor(example_input['input_ids']), skip_special_tokens=True))
+        inter_text = ' '.join(self.tokenizer.batch_decode(inter_summ_ids, skip_special_tokens=True))
+        print(f'Input: {inp_text}\nInter: {inter_text}\nOutput: {final_text}')
+
 
 def main():
     config = TrainingConfig()
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, padding_side='left')
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    logger.info("Loading dset...")
+    train_dset = load_dset_by_name(config.dset_name, tokenizer, recompute=False)
+
+    truncated_collate_fn = partial(collate_fn, is_test=True)
+    dataloader = DataLoader(train_dset, collate_fn=truncated_collate_fn, batch_size=config.batch_size, shuffle=True)
+
+    logger.info("Training Model 1 with PPO...")
     summ_model = AutoModelForCausalLM.from_pretrained(config.model_name, load_in_4bit=True).to(config.device) # policy network
     prev_summ_model = AutoModelForCausalLM.from_pretrained(config.model_name, load_in_4bit=True).to(config.device) # policy networkdeepcopy(summ_model)
 
-    logger.info("Loading dset...")
-    if os.path.exists(cached_dset_fp:='cached_cnn_dset'):
-        dset = load_from_disk(cached_dset_fp)
-    else:
-        dset = load_dataset("cnn_dailymail", "3.0.0", split="train[:1000]")
-        dset.save_to_disk(cached_dset_fp)
-
-    texts = [item["article"] for item in dset]
-    summaries = [item["highlights"] for item in dset]
-    train_dset = SummarizationDataset(texts, summaries, tokenizer, config.max_length)
-    dataloader = DataLoader(train_dset, batch_size=config.batch_size, shuffle=True)
-
-    #summ_model = train_summ_model_ntp(summ_model, tokenizer, train_dset, config)
-
-    logger.info("Training Model 1 with PPO...")
     ppo_trainer = PPOTrainer(summ_model, prev_summ_model, tokenizer, config)
     summ_model.train()
     prev_summ_model.eval()
@@ -209,10 +186,14 @@ def main():
                 breakpoint()
             pbar.set_description(f"Epoch {epoch+1} | Policy loss: {avg_ploss:.4f} | Value loss: {avg_vloss:.4f} | Reward: {avg_reward:.4f}")
 
+            if (batch_idx+1) % 100 == 0:
+                ppo_trainer.generate_example(np.random.choice(train_dset))
+
     summ_model.save_pretrained("./summ_model_ppo")
     prev_summ_model.save_pretrained("./prev_summ_model_ntp")
     tokenizer.save_pretrained("./tokenizer")
     logger.info("Training completed!")
+
 
 if __name__ == "__main__":
     main()
