@@ -22,13 +22,13 @@ class SummarizationDataset(Dataset):
         return {'input_ids': [x['input_ids'].squeeze() for x in inputs], 'attention_mask': [x['attention_mask'].squeeze() for x in inputs], 'target_ids': targets['input_ids'].squeeze(), 'target_attention_mask': targets['attention_mask'].squeeze()}
 
 
-def load_dset_by_name(dset_name, tokenizer, recompute):
+def load_dset_by_name(dset_name, tokenizer, dset_prefix, recompute):
     if dset_name == 'cnn-dailymail':
-        return load_cnn_dailymail(tokenizer, recompute)
+        return load_cnn_dailymail(tokenizer, dset_prefix, recompute)
     elif dset_name == 'moviesumm':
-        return load_moviesumm(tokenizer, recompute)
+        return load_moviesumm(tokenizer, dset_prefix, recompute)
 
-def load_cnn_dailymail(tokenizer, recompute):
+def load_cnn_dailymail(tokenizer, dset_prefix, recompute):
     cached_dset_fp = 'cached_tokenized/cnn'
 
     if not recompute and os.path.exists(cached_dset_fp):
@@ -56,10 +56,10 @@ def load_cnn_dailymail(tokenizer, recompute):
         dset.save_to_disk(cached_dset_fp)
     return dset
 
-def load_moviesumm(tokenizer, recompute):
-    transcripts_dir = '../amazon_video/data/transcripts'
-    summaries_dir = '../amazon_video/data/summaries'
-    cached_dset_fp = 'cached_tokenized/moviesumm'
+def load_moviesumm(tokenizer, dset_prefix, recompute):
+    transcripts_dir = os.path.join(dset_prefix, 'datasets/moviesumm/transcripts')
+    summaries_dir = os.path.join(dset_prefix, 'datasets/moviesumm/summaries')
+    cached_dset_fp = os.path.join(dset_prefix, 'datasets/moviesumm/cached_tokenized')
 
     if not recompute and os.path.exists(cached_dset_fp):
         dset = load_from_disk(cached_dset_fp)

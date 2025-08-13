@@ -1,9 +1,10 @@
+import os
 from functools import partial
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from load_dsets import load_dset_by_name, collate_fn
 import numpy as np
 import logging
@@ -17,10 +18,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TrainingConfig:
-    model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    model_name: str = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
     #model_name: str = 'llamafactory/tiny-random-Llama-3'
-    #model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
-    dset_name: str = "moviesumm"
+    #model_name: str = 'meta-llama/Llama-3.1-8B-Instruct'
+    dset_name: str = 'moviesumm'
     max_length: int = 512
     batch_size: int = 1
     learning_rate: float = 1e-6
@@ -32,7 +33,7 @@ class TrainingConfig:
     entropy_coeff: float = 0.01
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 class ValueNetwork(nn.Module):
     def __init__(self, model):
@@ -48,47 +49,46 @@ class ValueNetwork(nn.Module):
         return value.squeeze(-1)
 
 class PPOTrainer:
-    def __init__(self, summ_model, prev_summ_model, tokenizer, config: TrainingConfig):
+    def __init__(self, summ_model, prev_summ_model, tokenizer, args):
         self.summ_model = summ_model
         self.prev_summ_model = prev_summ_model
         self.tokenizer = tokenizer
-        self.config = config
-        summ_model_for_val_net = AutoModelForCausalLM.from_pretrained(config.model_name, load_in_4bit=True).to(config.device) # policy networkdeepcopy(summ_model)
-        self.value_net = ValueNetwork(summ_model_for_val_net).to(config.device)
-        self.summ_model_opt = torch.optim.AdamW(summ_model.parameters(), lr=config.learning_rate, eps=1)
-        self.value_optimizer = torch.optim.AdamW(self.value_net.parameters(), lr=config.learning_rate, eps=1)
-        self.summ_model.to(config.device)
-        self.prev_summ_model.to(config.device)
+        self.args = args
+        self.device = args.device
+        self.batch_size = args.batch_size
+        summ_model_for_val_net = AutoModelForCausalLM.from_pretrained(args.model_name, load_in_4bit=True).to(args.device) # policy networkdeepcopy(summ_model)
+        self.value_net = ValueNetwork(summ_model_for_val_net).to(args.device)
+        self.summ_model_opt = torch.optim.AdamW(summ_model.parameters(), lr=args.learning_rate, eps=1)
+        self.value_optimizer = torch.optim.AdamW(self.value_net.parameters(), lr=args.learning_rate, eps=1)
+        self.summ_model.to(args.device)
+        self.prev_summ_model.to(args.device)
         self.disc_fac = 0.9
         self.max_inter_summ_len = 10
         self.eps = 0.2
 
     def train_step(self, batch):
-        batch = {k:v.to(self.config.device) for k,v in batch.items()}
+        batch = {k:v.to(self.device) for k,v in batch.items()}
         inter_summ_outputs = self.summ_model.generate(input_ids=batch['input_ids'][0], attention_mask=batch['attention_mask'][0], max_new_tokens=self.max_inter_summ_len, pad_token_id=self.tokenizer.pad_token_id, return_dict_in_generate=True, output_scores=True, temperature=1, top_p=1, do_sample=False)
         inter_summ_ids = torch.tensor(inter_summ_outputs.sequences)[:,-self.max_inter_summ_len:]
         eos_mask = torch.cumsum((inter_summ_ids == self.tokenizer.eos_token_id).long(), dim=1)
         inter_summ_attn_mask = (eos_mask <= 1).long()
-        #inter_summ_ids, inter_summ_attn_mask = inter_summ_ids.flatten(), inter_summ_attn_mask.flatten()
 
         final_summ_input_ids = torch.cat([inter_summ_ids.flatten(), batch['target_ids'].squeeze(0)])
         final_summ_attn_mask = torch.cat([inter_summ_attn_mask.flatten(), batch['target_attention_mask'].squeeze(0)])
         final_summ_labels = torch.cat([-100*torch.ones_like(inter_summ_ids.flatten()), batch['target_ids'].squeeze(0)])
         final_summ_outputs = self.summ_model(input_ids=final_summ_input_ids.unsqueeze(0), attention_mask=final_summ_attn_mask.unsqueeze(0), labels=final_summ_labels.unsqueeze(0))
         logits = final_summ_outputs.logits
-        vocab_size = logits.size(-1)
-        loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+        loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
         losses = loss_fn(logits.permute(0,2,1), final_summ_labels.unsqueeze(0))
         per_item_loss = losses.mean(dim=1)  # mean over tokens per example
         final_reward = -per_item_loss.detach()
         final_summ_loss = per_item_loss.mean()
 
-        #value_preds = self.value_net(batch['input_ids'], inter_summ_ids) # assume input_ids already contains a prompt telling model to summarise
         value_preds = self.value_net(batch['input_ids'][0], inter_summ_ids) # assume input_ids already contains a prompt telling model to summarise
         N = inter_summ_attn_mask.sum(axis=1)
         advantages_lst = []
         value_loss = 0
-        for bidx in range(self.config.batch_size):
+        for bidx in range(self.batch_size):
             bfr = final_reward[bidx:bidx+1].detach() # idx this way in order to keepdim
             bvp = value_preds[bidx, :N[bidx]+1]
             value_targets = self.disc_fac*value_preds[bidx, 1:N[bidx]+1].detach() # shift by 1 because value_preds predicts sth for the bare prompt at start
@@ -101,7 +101,8 @@ class PPOTrainer:
             if value_loss.isnan():
                 breakpoint()
 
-        value_loss = 1e-5*value_loss / self.config.batch_size
+        #value_loss = 1e-5*value_loss / self.batch_size
+        value_loss = value_loss / self.batch_size
         advantages = torch.stack(advantages_lst)
         # PPO update
         pis_inputs = torch.cat([batch['input_ids'][0], inter_summ_ids], axis=1)
@@ -131,7 +132,7 @@ class PPOTrainer:
         value_loss.backward()
         self.value_optimizer.step()
 
-        scores = {"policy_loss": policy_loss.item(), "value_loss": value_loss.item(), "reward": final_reward.mean().item()}
+        scores = {'policy_loss': policy_loss.item(), 'value_loss': value_loss.item(), 'reward': final_reward.mean().item()}
         after_nans = [n for n,x in self.summ_model.named_parameters() if x.isnan().any()]
         if len(after_nans) > 0:
             print(f'nan params in summ_model: {after_nans}')
@@ -150,50 +151,74 @@ class PPOTrainer:
 
 
 def main():
-    config = TrainingConfig()
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, padding_side='left')
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dset-prefix', type=str, default='.')
+    parser.add_argument('--model-save-dir', type=str, default='.')
+    parser.add_argument('--is-test', '-t', action='store_true')
+    parser.add_argument('--model_name', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0')
+    parser.add_argument('--dset_name', type=str, default='moviesumm')
+    parser.add_argument('--max_length', type=int, default=512)
+    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--learning_rate', type=float, default=1e-6)
+    parser.add_argument('--num_epochs', type=int, default=10)
+    parser.add_argument('--warmup_steps', type=int, default=100)
+    parser.add_argument('--ppo_epochs', type=int, default=4)
+    parser.add_argument('--ppo_clip_ratio', type=float, default=0.02)
+    parser.add_argument('--value_coeff', type=float, default=0.5)
+    parser.add_argument('--entropy_coeff', type=float, default=0.01)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--gae_lambda', type=float, default=0.95)
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    ARGS = parser.parse_args()
+
+    #config = TrainingConfig()
+    tokenizer = AutoTokenizer.from_pretrained(ARGS.model_name, padding_side='left')
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    logger.info("Loading dset...")
-    train_dset = load_dset_by_name(config.dset_name, tokenizer, recompute=False)
+    logger.info('Loading dset...')
+    train_dset = load_dset_by_name(ARGS.dset_name, tokenizer, ARGS.dset_prefix, recompute=False)
 
     truncated_collate_fn = partial(collate_fn, is_test=True)
-    dataloader = DataLoader(train_dset, collate_fn=truncated_collate_fn, batch_size=config.batch_size, shuffle=True)
+    dataloader = DataLoader(train_dset, collate_fn=truncated_collate_fn, batch_size=ARGS.batch_size, shuffle=True)
 
-    logger.info("Training Model 1 with PPO...")
-    summ_model = AutoModelForCausalLM.from_pretrained(config.model_name, load_in_4bit=True).to(config.device) # policy network
-    prev_summ_model = AutoModelForCausalLM.from_pretrained(config.model_name, load_in_4bit=True).to(config.device) # policy networkdeepcopy(summ_model)
+    logger.info('Training Model 1 with PPO...')
+    summ_model = AutoModelForCausalLM.from_pretrained(ARGS.model_name, load_in_4bit=True).to(ARGS.device) # policy network
+    prev_summ_model = AutoModelForCausalLM.from_pretrained(ARGS.model_name, load_in_4bit=True).to(ARGS.device) # policy networkdeepcopy(summ_model)
 
-    ppo_trainer = PPOTrainer(summ_model, prev_summ_model, tokenizer, config)
+    ppo_trainer = PPOTrainer(summ_model, prev_summ_model, tokenizer, ARGS)
     summ_model.train()
     prev_summ_model.eval()
 
-    for epoch in range(config.num_epochs):
+    for epoch in range(ARGS.num_epochs):
         epoch_plosses = []
         epoch_vlosses = []
         epoch_rewards = []
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+        pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}')
         for batch_idx, batch in enumerate(pbar):
             metrics = ppo_trainer.train_step(batch)
-            epoch_plosses.append(metrics["policy_loss"])
-            epoch_vlosses.append(metrics["value_loss"])
-            epoch_rewards.append(metrics["reward"])
+            epoch_plosses.append(metrics['policy_loss'])
+            epoch_vlosses.append(metrics['value_loss'])
+            epoch_rewards.append(metrics['reward'])
 
             avg_ploss = np.mean(epoch_plosses)
             avg_vloss = np.mean(epoch_vlosses)
             avg_reward = np.mean(epoch_rewards)
             if np.isnan(avg_ploss):
                 breakpoint()
-            pbar.set_description(f"Epoch {epoch+1} | Policy loss: {avg_ploss:.4f} | Value loss: {avg_vloss:.4f} | Reward: {avg_reward:.4f}")
+            pbar.set_description(f'Epoch {epoch+1} | Policy loss: {avg_ploss:.4f} | Value loss: {avg_vloss:.4f} | Reward: {avg_reward:.4f}')
 
-            if (batch_idx+1) % 100 == 0:
+            if ((batch_idx+1) % 100 == 0) or ARGS.is_test:
                 ppo_trainer.generate_example(np.random.choice(train_dset))
 
-    summ_model.save_pretrained("./summ_model_ppo")
-    prev_summ_model.save_pretrained("./prev_summ_model_ntp")
-    tokenizer.save_pretrained("./tokenizer")
-    logger.info("Training completed!")
+            if ARGS.is_test:
+                break
+
+    summ_model.save_pretrained(os.path.join(ARGS.model_save_dir, 'summ_model_ppo'))
+    prev_summ_model.save_pretrained(os.path.join(ARGS.model_save_dir, 'prev_summ_model_ntp'))
+    tokenizer.save_pretrained(os.path.join(ARGS.model_save_dir, 'tokenizer'))
+    logger.info('Training completed!')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
