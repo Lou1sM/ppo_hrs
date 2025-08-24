@@ -63,7 +63,7 @@ class PPOTrainer:
         self.summ_model.to(args.device)
         self.prev_summ_model.to(args.device)
         self.disc_fac = 0.9
-        self.max_inter_summ_len = 10
+        self.max_inter_summ_len = args.max_inter_summ_len
         self.eps = 0.2
 
     def train_step(self, batch):
@@ -141,6 +141,7 @@ class PPOTrainer:
 
     def generate_example(self, example_input):
         inter_summ_outputs = self.summ_model.generate(input_ids=torch.tensor(example_input['input_ids']).to(self.summ_model.device)[:3,-1000:], max_new_tokens=self.max_inter_summ_len, pad_token_id=self.tokenizer.pad_token_id, return_dict_in_generate=True, output_scores=True, temperature=1, top_p=1, do_sample=False)
+        breakpoint()
         inter_summ_ids = inter_summ_outputs.sequences[0,-self.max_inter_summ_len:]
         final_summ_input_ids = torch.cat([torch.tensor(self.tokenizer('Summarise the following text: ').input_ids, device=self.summ_model.device), inter_summ_ids], axis=0)
         final_summ_genned_ids = self.summ_model.generate(input_ids=final_summ_input_ids.unsqueeze(0))
@@ -159,6 +160,7 @@ def main():
     parser.add_argument('--model_name', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0')
     parser.add_argument('--dset_name', type=str, default='moviesumm')
     parser.add_argument('--max_length', type=int, default=512)
+    parser.add_argument('--max-inter-summ-len', type=int, default=512)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--learning_rate', type=float, default=1e-6)
     parser.add_argument('--num_epochs', type=int, default=10)
