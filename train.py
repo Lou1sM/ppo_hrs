@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from load_dsets import load_dset_by_name, collate_fn
 import numpy as np
 import logging
@@ -140,7 +140,7 @@ class PPOTrainer:
         return scores
 
     def generate_example(self, example_input):
-        inter_summ_outputs = self.summ_model.generate(input_ids=torch.tensor(example_input['input_ids']).to(self.summ_model.device)[:3,-1000:], max_new_tokens=self.max_inter_summ_len, pad_token_id=self.tokenizer.pad_token_id, return_dict_in_generate=True, output_scores=True, temperature=1, top_p=1, do_sample=False)
+        inter_summ_outputs = self.summ_model.generate(input_ids=torch.tensor(example_input['input_ids']).to(self.summ_model.device)[:3,-1000:], max_new_tokens=self.max_inter_summ_len, min_new_tokens=self.max_inter_summ_len-20, pad_token_id=self.tokenizer.pad_token_id, return_dict_in_generate=True, output_scores=True, temperature=1, top_p=1, do_sample=False)
         breakpoint()
         inter_summ_ids = inter_summ_outputs.sequences[0,-self.max_inter_summ_len:]
         final_summ_input_ids = torch.cat([torch.tensor(self.tokenizer('Summarise the following text: ').input_ids, device=self.summ_model.device), inter_summ_ids], axis=0)
@@ -185,8 +185,10 @@ def main():
     dataloader = DataLoader(train_dset, collate_fn=truncated_collate_fn, batch_size=ARGS.batch_size, shuffle=True)
 
     logger.info('Training Model 1 with PPO...')
-    summ_model = AutoModelForCausalLM.from_pretrained(ARGS.model_name, load_in_4bit=True).to(ARGS.device) # policy network
-    prev_summ_model = AutoModelForCausalLM.from_pretrained(ARGS.model_name, load_in_4bit=True).to(ARGS.device) # policy networkdeepcopy(summ_model)
+    bnb_config = BitsAndBytesConfig(load_in_4bit=True)
+    summ_model = AutoModelForCausalLM.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0', quantization_config=bnb_config, device_map="auto")
+    #prev_summ_model = AutoModelForCausalLM.from_pretrained(ARGS.model_name, load_in_4bit=True).to(ARGS.device) # policy networkdeepcopy(summ_model)
+    prev_summ_model = AutoModelForCausalLM.from_pretrained('TinyLlama/TinyLlama-1.1B-Chat-v1.0', quantization_config=bnb_config, device_map="auto")
 
     ppo_trainer = PPOTrainer(summ_model, prev_summ_model, tokenizer, ARGS)
     summ_model.train()
