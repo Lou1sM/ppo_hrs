@@ -90,13 +90,13 @@ def load_moviesumm(tokenizer, dset_prefix, recompute):
                     ex['input'],
                     max_length=2048,
                     truncation=True,
-                    padding='max_length'
+                    padding='longest'
                 )
                 targets = tokenizer(
                     ex['summary'],
                     max_length=512,
                     truncation=True,
-                    padding='max_length'
+                    padding='longest'
                 )
                 return {
                     'input_ids': inputs['input_ids'],

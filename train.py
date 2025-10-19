@@ -68,7 +68,7 @@ class PPOTrainer:
 
     def train_step(self, batch):
         batch = {k:v.to(self.device) for k,v in batch.items()}
-        inter_summ_outputs = self.summ_model.generate(input_ids=batch['input_ids'][0], attention_mask=batch['attention_mask'][0], max_new_tokens=self.max_inter_summ_len, pad_token_id=self.tokenizer.pad_token_id, return_dict_in_generate=True, output_scores=True, temperature=1, top_p=1, do_sample=False)
+        inter_summ_outputs = self.summ_model.generate(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], max_new_tokens=self.max_inter_summ_len, pad_token_id=self.tokenizer.pad_token_id, return_dict_in_generate=True, output_scores=True, temperature=1, top_p=1, do_sample=False)
         inter_summ_ids = torch.tensor(inter_summ_outputs.sequences)[:,-self.max_inter_summ_len:]
         eos_mask = torch.cumsum((inter_summ_ids == self.tokenizer.eos_token_id).long(), dim=1)
         inter_summ_attn_mask = (eos_mask <= 1).long()
@@ -84,7 +84,7 @@ class PPOTrainer:
         final_reward = -per_item_loss.detach()
         final_summ_loss = per_item_loss.mean()
 
-        value_preds = self.value_net(batch['input_ids'][0], inter_summ_ids) # assume input_ids already contains a prompt telling model to summarise
+        value_preds = self.value_net(batch['input_ids'], inter_summ_ids) # assume input_ids already contains a prompt telling model to summarise
         N = inter_summ_attn_mask.sum(axis=1)
         advantages_lst = []
         value_loss = 0
@@ -105,8 +105,8 @@ class PPOTrainer:
         value_loss = value_loss / self.batch_size
         advantages = torch.stack(advantages_lst)
         # PPO update
-        pis_inputs = torch.cat([batch['input_ids'][0], inter_summ_ids], axis=1)
-        pis_attn = torch.cat([batch['attention_mask'][0], inter_summ_attn_mask], axis=1)
+        pis_inputs = torch.cat([batch['input_ids'], inter_summ_ids], axis=1)
+        pis_attn = torch.cat([batch['attention_mask'], inter_summ_attn_mask], axis=1)
         def probs_from_model(m):
             with torch.no_grad():
                 m_outputs = m(input_ids=pis_inputs, attention_mask=pis_attn)#, labels=final_summ_labels)
